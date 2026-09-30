@@ -1,0 +1,168 @@
+// ============================================================================
+// FUNCTION 3 (v5) — REJECT TRANSITION  · replaces v4 · USE THIS ONE
+// CHANGE FROM v4: bridge call converted to the proven GET transport.
+// ============================================================================
+// CHANGE FROM v3 (Plan B notes): the optional agent note comes from the
+// "Approver Note" field (cf_approver_note) instead of ticket comments, and
+// the field is cleared after the thread post.
+// CHANGE FROM v2: the client's first name for the email greeting now comes
+// from the CONTACT record (first word of the full name your form saves there).
+// No cf first-name field is needed — CF_FIRSTNAME removed. This replaces the
+// interim CF_FIRSTNAME = "contactId" workaround, which would have made every
+// email read "Hi there".
+//
+// WHERE IT RUNS : Blueprint transition "Business Team Review -> Rejected" (T1)
+// ARGUMENTS     : ticketId -> Value: Ticket Id (field)
+//                 orgId    -> Value: Specify custom value -> your org ID
+// ============================================================================
+
+// ------------------------------ CONFIG --------------------------------------
+ORG = orgId.toLong();
+// Connection: Deluge requires the connection LINK NAME as a literal string
+// at every call site, so "zdesk" is written directly below. If your
+// connection link name differs, find-replace "zdesk" in this file.
+BRIDGE_URL = "https://script.google.com/macros/s/YOUR_DEPLOYMENT_ID/exec";        // ends in /exec
+BRIDGE_KEY = "YOUR_VALUE_HERE";          // same string as in the bridge
+GCHAT_WEBHOOK = "https://chat.googleapis.com/v1/spaces/SPACE_ID/messages?key=KEY&token=TOKEN";
+FROM_EMAIL = "support@example.com";
+CF_REJECT = "cf_reject_reason";
+CF_NOTE = "cf_multi_line_1";                 // verify exact API name (Fields List)
+
+// ---- EDITABLE EMAIL WORDING (one entry per Reject Reason picklist value) ----
+// {{NAME}} is replaced with the client's first name.
+reasonBodies = Map();
+reasonBodies.put("Profiles not public", "<p>Hi {{NAME}},</p><p>Thanks for your certificate posting submission. We couldn't verify your posts because your X/Instagram profile is private. Please make both profiles public and submit the form again - your eligibility is not affected.</p><p>Team Acme Trading</p>");
+reasonBodies.put("Hashtags missing or incorrect", "<p>Hi {{NAME}},</p><p>Thanks for your submission. The required hashtags (#proptrading, #forextrading, #fastpayouts) were missing or incorrect on one or both posts. Please update your posts and submit the form again.</p><p>Team Acme Trading</p>");
+reasonBodies.put("Official accounts not tagged", "<p>Hi {{NAME}},</p><p>Thanks for your submission. Our official accounts (@acmetrading on X, @acmetrading_official on Instagram) were not tagged. Please update your posts and submit the form again.</p><p>Team Acme Trading</p>");
+reasonBodies.put("Certificate cropped or unclear", "<p>Hi {{NAME}},</p><p>Thanks for your submission. The payout certificate in your post appears cropped or unclear. Please repost with the full certificate visible and submit the form again.</p><p>Team Acme Trading</p>");
+reasonBodies.put("First name not visible", "<p>Hi {{NAME}},</p><p>Thanks for your submission. You may mask your last name, but your first name must be visible on the certificate. Please repost accordingly and submit the form again.</p><p>Team Acme Trading</p>");
+reasonBodies.put("Posted after allowed window", "<p>Hi {{NAME}},</p><p>Thanks for your submission. Unfortunately the certificate was posted outside the allowed window after your payout, so this submission doesn't qualify. You're welcome to participate with your next payout certificate.</p><p>Team Acme Trading</p>");
+reasonBodies.put("Already claimed for this payout", "<p>Hi {{NAME}},</p><p>Thanks for your submission. Our records show a discount has already been claimed for this payout certificate. Each payout qualifies once - you're welcome to participate again with your next payout.</p><p>Team Acme Trading</p>");
+reasonBodies.put("No payout record found", "<p>Hi {{NAME}},</p><p>Thanks for your submission. We couldn't locate a payout under the details provided. Please double-check your account number and the email used, then submit the form again.</p><p>Team Acme Trading</p>");
+reasonBodies.put("Duplicate submission", "<p>Hi {{NAME}},</p><p>Thanks for your submission. We already have an open request for this certificate, so this duplicate has been closed. We'll update you on the original request shortly.</p><p>Team Acme Trading</p>");
+genericBody = "<p>Hi {{NAME}},</p><p>Thanks for your certificate posting submission. Unfortunately it couldn't be approved this time. Please review the campaign requirements and feel free to submit again.</p><p>Team Acme Trading</p>";
+
+log = "";
+NL = zoho.encryption.urlDecode("%0A");   // real newline (Deluge NL is literal text)
+
+// --------------------- 1. FETCH TICKET + CONTACT NAME ------------------------
+ticket = zoho.desk.getRecordById(ORG, "tickets", ticketId.toLong(), "zdesk");
+cf = ifnull(ticket.get("cf"), Map());
+tn = ifnull(ticket.get("ticketNumber"), ticketId).toString();
+email = ifnull(ticket.get("email"), "").toString().trim().toLowerCase();
+reason = ifnull(cf.get(CF_REJECT), "Other").toString();
+note = ifnull(cf.get(CF_NOTE), "").toString().trim();
+
+firstName = "there";
+if(ticket.get("contactId") != null)
+{
+	contact = zoho.desk.getRecordById(ORG, "contacts", ticket.get("contactId").toLong(), "zdesk");
+	cname = (ifnull(contact.get("firstName"), "") + " " + ifnull(contact.get("lastName"), "")).toString().trim();
+	if(cname != "")
+	{
+		firstName = cname;
+		if(cname.contains(" "))
+		{
+			firstName = cname.getPrefix(" ").trim();
+		}
+	}
+	if(email == "")
+	{
+		email = ifnull(contact.get("email"), "").toString().trim().toLowerCase();
+	}
+}
+
+// --------------- 2. DELETE THIS TICKET'S ROWS VIA THE BRIDGE -----------------
+bhdr = Map();
+bhdr.put("Content-Type", "application/json");
+pd = Map();
+pd.put("key", BRIDGE_KEY);
+pd.put("action", "deleteRows");
+pd.put("ticket", tn);
+rd = invokeurl
+[
+	url : BRIDGE_URL + "?payload=" + zoho.encryption.urlEncode(pd.toString())
+	type : GET
+];
+rd = rd.toString().toMap();
+rowsRemoved = "no rows existed yet";
+if(rd != null && ifnull(rd.get("ok"), false) == true)
+{
+	pDel = ifnull(rd.get("payoutDeleted"), "0").toString();
+	cDel = ifnull(rd.get("couponDeleted"), "0").toString();
+	if(pDel != "0" || cDel != "0")
+	{
+		rowsRemoved = "rows removed (Auto Payout: " + pDel + ", Coupon Codes: " + cDel + ")";
+	}
+}
+else
+{
+	rowsRemoved = "BRIDGE ERROR - rows may still exist, check manually";
+}
+log = log + "Ticket #" + tn + " | " + rowsRemoved + NL;
+
+// --------------------- 3. SEND THE REJECTION EMAIL --------------------------
+bodyHtml = ifnull(reasonBodies.get(reason), genericBody).toString();
+bodyHtml = bodyHtml.replaceAll("{{NAME}}", firstName);
+
+mail = Map();
+mail.put("channel", "EMAIL");
+mail.put("to", email);
+mail.put("fromEmailAddress", FROM_EMAIL);
+mail.put("contentType", "html");
+mail.put("content", bodyHtml);
+hdr = Map();
+hdr.put("orgId", orgId);
+hdr.put("Content-Type", "application/json");
+invokeurl
+[
+	url : "https://desk.zoho.in/api/v1/tickets/" + ticketId + "/sendReply"
+	type : POST
+	parameters : mail.toString()
+	headers : hdr
+	connection : "zdesk"
+];
+log = log + "Rejection email (" + reason + ") sent to " + email + NL;
+
+// --------- 4. THREAD: AGENT'S NOTE VERBATIM + ONE SYSTEM LINE ---------------
+author = "Team member";
+if(ticket.get("modifiedBy") != null)
+{
+	agent = zoho.desk.getRecordById(ORG, "agents", ticket.get("modifiedBy").toLong(), "zdesk");
+	if(agent != null)
+	{
+		author = (ifnull(agent.get("firstName"), "") + " " + ifnull(agent.get("lastName"), "")).toString().trim();
+	}
+}
+// (note was read from the Approver Note field in step 1)
+
+msg = "";
+if(note != "")
+{
+	msg = author + ": " + note + NL;
+}
+msg = msg + "❌ Rejected - " + reason + ". " + rowsRemoved + ". Rejection email sent to client. Ticket closed.";
+
+body = Map();
+body.put("text", msg);
+thread = Map();
+thread.put("threadKey", "cert-" + tn);
+body.put("thread", thread);
+chatHdr = Map();
+chatHdr.put("Content-Type", "application/json");
+invokeurl
+[
+	url : GCHAT_WEBHOOK + "&messageReplyOption=REPLY_MESSAGE_FALLBACK_TO_NEW_THREAD"
+	type : POST
+	parameters : body.toString()
+	headers : chatHdr
+];
+
+// Clear the note field so nothing stale leaks forward:
+upd = Map();
+cfm2 = Map();
+cfm2.put(CF_NOTE, "");
+upd.put("cf", cfm2);
+zoho.desk.update(ORG, "tickets", ticketId.toLong(), upd, "zdesk");
+
+info log;

@@ -1,0 +1,94 @@
+// ============================================================================
+// FUNCTION 1 (v5) — ON-CREATE ELIGIBILITY CHECK  · replaces v4 · USE THIS ONE
+// ============================================================================
+// CHANGE FROM v4: the sheet layer now goes through the Google Apps Script
+// BRIDGE (web app on the master Google Sheet) instead of zoho.sheet tasks.
+// The zsheet connection and RESOURCE_ID are no longer needed here.
+//
+// ELIGIBILITY RULE (as decided): count Auto Payout rows where Email matches
+// AND Certificate Type is exactly "Payout" — any era (90/70/60), any
+// Approved Status including blank. 0 rows -> 60 First Claim, else 30.
+//
+// WHERE IT RUNS : Workflow rule -> Execute on CREATE, dept Certificate Posting
+// ARGUMENTS     : ticketId -> Value: Ticket Id (field)
+//                 orgId    -> Value: Specify custom value -> your org ID
+//
+// NOTE ON RESPONSES: invokeurl normally auto-parses the bridge's JSON reply
+// into a Map. If you ever see an error like "get is not supported for STRING",
+// add this line right after the invokeurl call:  bres = bres.toMap();
+// ============================================================================
+
+// ------------------------------ CONFIG --------------------------------------
+ORG = orgId.toLong();
+// Connection: Deluge requires the connection LINK NAME as a literal string
+// at every call site, so "zdesk" is written directly below. If your
+// connection link name differs, find-replace "zdesk" in this file.
+BRIDGE_URL = "https://script.google.com/macros/s/YOUR_DEPLOYMENT_ID/exec";        // ends in /exec
+BRIDGE_KEY = "YOUR_VALUE_HERE";          // same string as in the bridge
+
+CF_ELIGIBILITY = "cf_eligibility_status";      // verify exact API name
+
+log = "";
+
+// ------------------------ 1. FETCH TICKET + EMAIL ---------------------------
+ticket = zoho.desk.getRecordById(ORG, "tickets", ticketId.toLong(), "zdesk");
+tn = ifnull(ticket.get("ticketNumber"), ticketId).toString();
+
+email = ifnull(ticket.get("email"), "").toString();
+if(email == "" && ticket.get("contactId") != null)
+{
+	contact = zoho.desk.getRecordById(ORG, "contacts", ticket.get("contactId").toLong(), "zdesk");
+	email = ifnull(contact.get("email"), "").toString();
+}
+email = email.trim().toLowerCase();
+log = log + "Ticket #" + tn + " | email=" + email + "\n";
+
+if(email == "")
+{
+	// Leave Eligibility Status empty on purpose — the visible signal that
+	// this ticket needs a manual look. (Form must keep Email mandatory.)
+	info "No email on ticket #" + tn + " - Eligibility Status left empty, review manually";
+	return;
+}
+
+// --------------- 2. ASK THE BRIDGE FOR PRIOR PAYOUT CLAIMS -------------------
+payload = Map();
+payload.put("key", BRIDGE_KEY);
+payload.put("action", "checkEligibility");
+payload.put("email", email);
+bhdr = Map();
+bhdr.put("Content-Type", "application/json");
+bres = invokeurl
+[
+	url : BRIDGE_URL + "?payload=" + zoho.encryption.urlEncode(payload.toString())
+	type : GET
+];
+info "Bridge raw: " + bres;
+bres = bres.toString().toMap();
+if(bres == null || ifnull(bres.get("ok"), false) != true)
+{
+	info "BRIDGE ERROR on ticket #" + tn + " - eligibility not set. Response: " + bres;
+	return;
+}
+priorClaims = ifnull(bres.get("priorPayoutClaims"), "0").toString().toLong();
+log = log + "Prior Payout rows found: " + priorClaims + "\n";
+
+// MUST match the Eligibility Status picklist values EXACTLY:
+if(priorClaims == 0)
+{
+	eligibility = "Eligible - 60 First Claim";
+}
+else
+{
+	eligibility = "Eligible - 30 Subsequent";
+}
+
+// -------------------- 3. WRITE RESULT ONTO THE TICKET -----------------------
+upd = Map();
+cfm = Map();
+cfm.put(CF_ELIGIBILITY, eligibility);
+upd.put("cf", cfm);
+zoho.desk.update(ORG, "tickets", ticketId.toLong(), upd, "zdesk");
+
+log = log + "Set: " + eligibility;
+info log;

@@ -1,0 +1,100 @@
+// ============================================================================
+// FUNCTION 5 (v3) — GCHAT NOTE RELAY  · replaces v2 · USE THIS ONE
+// ============================================================================
+// CHANGES FROM v2 (Plan B — no comment toggle on your Blueprint transitions):
+//   - The note now comes from the ticket field "Approver Note"
+//     (cf_approver_note), which sits MANDATORY on the During screen of all
+//     seven middle transitions. The comments API is no longer used.
+//   - After posting, the function CLEARS the field. This is what makes a
+//     reused field safe: the next transition's During screen opens empty, so
+//     "mandatory" forces fresh typing and nobody's words get reposted under
+//     someone else's name.
+//   - Director auto-mention unchanged (fires when status = "Director Review");
+//     guard also treats a leftover placeholder as "no ID yet".
+//
+// WHERE IT RUNS : all seven middle transitions: T3, T4, T5, T6, T7, T8, T9
+//                 (six-state Blueprint: T7 = Director Review -> Ops Team Review,
+//                  T9 = Ops Team Review -> Business Team Review)
+// ARGUMENTS     : ticketId -> Value: Ticket Id (field)
+//                 orgId    -> Value: Specify custom value -> your org ID
+// ============================================================================
+
+// ------------------------------ CONFIG --------------------------------------
+ORG = orgId.toLong();
+// Connection: Deluge requires the connection LINK NAME as a literal string
+// at every call site, so "zdesk" is written directly below. If your
+// connection link name differs, find-replace "zdesk" in this file.
+GCHAT_WEBHOOK = "https://chat.googleapis.com/v1/spaces/SPACE_ID/messages?key=KEY&token=TOKEN";
+DIRECTOR_GCHAT_ID = "";                          // paste her Google ID when you have it
+DIRECTOR_STATUS = "Director Review";                // must match the status name exactly
+CF_NOTE = "cf_multi_line_1";                 // verify exact API name (Fields List)
+
+log = "";
+NL = zoho.encryption.urlDecode("%0A");   // real newline (Deluge NL is literal text)
+
+// ------------------- 1. TICKET: thread key, status, note --------------------
+ticket = zoho.desk.getRecordById(ORG, "tickets", ticketId.toLong(), "zdesk");
+cf = ifnull(ticket.get("cf"), Map());
+tn = ifnull(ticket.get("ticketNumber"), ticketId).toString();
+status = ifnull(ticket.get("status"), "").toString();
+
+note = ifnull(cf.get(CF_NOTE), "").toString().trim();
+if(note == "")
+{
+	// The During screen makes the note mandatory on every transition this
+	// function is attached to, so an empty note means this firing was not a
+	// real transition — exit silently instead of posting noise.
+	info "skipped - no note";
+	return;
+}
+
+// ------------------- 2. WHO PERFORMED THE TRANSITION ------------------------
+author = "Team member";
+if(ticket.get("modifiedBy") != null)
+{
+	agent = zoho.desk.getRecordById(ORG, "agents", ticket.get("modifiedBy").toLong(), "zdesk");
+	if(agent != null)
+	{
+		author = (ifnull(agent.get("firstName"), "") + " " + ifnull(agent.get("lastName"), "")).toString().trim();
+	}
+}
+
+// -------- 3. MENTION LOGIC: ping Director only when the ticket reached her -----
+mentionUserId = "";
+if(status == DIRECTOR_STATUS && DIRECTOR_GCHAT_ID != "" && DIRECTOR_GCHAT_ID != "PASTE_DIRECTOR_GOOGLE_USER_ID")
+{
+	mentionUserId = DIRECTOR_GCHAT_ID;
+}
+
+// ------------------- 4. POST INTO THE TICKET'S THREAD -----------------------
+msg = "";
+if(mentionUserId != "")
+{
+	msg = "<users/" + mentionUserId + "> ";
+}
+msg = msg + author + ": " + note;
+
+body = Map();
+body.put("text", msg);
+thread = Map();
+thread.put("threadKey", "cert-" + tn);
+body.put("thread", thread);
+chatHdr = Map();
+chatHdr.put("Content-Type", "application/json");
+invokeurl
+[
+	url : GCHAT_WEBHOOK + "&messageReplyOption=REPLY_MESSAGE_FALLBACK_TO_NEW_THREAD"
+	type : POST
+	parameters : body.toString()
+	headers : chatHdr
+];
+
+// ------------- 5. CLEAR THE NOTE FIELD (prevents stale reposts) -------------
+upd = Map();
+cfm = Map();
+cfm.put(CF_NOTE, "");
+upd.put("cf", cfm);
+zoho.desk.update(ORG, "tickets", ticketId.toLong(), upd, "zdesk");
+
+log = "Relayed to thread cert-" + tn + " | " + author + " | status: " + status + " | note field cleared";
+info log;

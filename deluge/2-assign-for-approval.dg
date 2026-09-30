@@ -1,0 +1,296 @@
+// ============================================================================
+// FUNCTION 2 (v8) — ASSIGN-TO-MANAGER TRANSITION  · replaces v7 · USE THIS
+// ============================================================================
+// CHANGES FROM v7:
+//   - ALL bridge calls now use the proven GET transport (payload in the URL),
+//     matching working F1. No headers, no POST, no redirect problem.
+//   - The dual-tab write is split into TWO bridge calls (payout row, then
+//     coupon row) so each URL stays short. The bridge already supports this;
+//     no bridge change or redeploy is needed.
+// Everything else retained: contact-derived first name, Plan B note field
+// (read + cleared), literal "zdesk", void-safe exits, mention guard.
+//
+// WHERE IT RUNS : Blueprint transition "Business Team Review -> Manager
+//                 Approval" (T2). After list must be: 2 field updates + F2.
+// ARGUMENTS     : ticketId -> Value: Ticket Id (field)
+//                 orgId    -> Value: Specify custom value -> your org ID
+// ============================================================================
+
+// ------------------------------ CONFIG --------------------------------------
+ORG = orgId.toLong();
+// Connection: Deluge requires the connection LINK NAME as a literal string
+// at every call site, so "zdesk" is written directly below. If your
+// connection link name differs, find-replace "zdesk" in this file.
+BRIDGE_URL = "https://script.google.com/macros/s/YOUR_DEPLOYMENT_ID/exec";
+BRIDGE_KEY = "YOUR_VALUE_HERE";
+GCHAT_WEBHOOK = "https://chat.googleapis.com/v1/spaces/SPACE_ID/messages?key=KEY&token=TOKEN";
+MANAGER_GCHAT_ID = "";                               // paste her Google ID when you have it
+ACCOUNT_APPLIES = "$10K to $100K Challenge accounts";
+
+CF_ACCOUNT = "cf_account_number";
+CF_PRODUCT = "cf_product_type";
+CF_POSTED24 = "cf_posted_within_24_hrs";
+CF_XLINK = "cf_x_link";
+CF_IGLINK = "cf_instagram_link";
+CF_ELIGIBILITY = "cf_eligibility_status";
+CF_CODE = "cf_discount_code";
+CF_NOTE = "cf_multi_line_1";                 // verify exact API name (Fields List)
+
+log = "";
+NL = zoho.encryption.urlDecode("%0A");   // real newline (Deluge NL is literal text)
+
+// --------------------- 1. FETCH TICKET + CONTACT ----------------------------
+ticket = zoho.desk.getRecordById(ORG, "tickets", ticketId.toLong(), "zdesk");
+cf = ifnull(ticket.get("cf"), Map());
+tn = ifnull(ticket.get("ticketNumber"), ticketId).toString();
+
+email = ifnull(ticket.get("email"), "").toString().trim().toLowerCase();
+account = ifnull(cf.get(CF_ACCOUNT), "").toString().trim();
+product = ifnull(cf.get(CF_PRODUCT), "").toString();
+posted24 = ifnull(cf.get(CF_POSTED24), "").toString();
+xlink = ifnull(cf.get(CF_XLINK), "").toString();
+iglink = ifnull(cf.get(CF_IGLINK), "").toString();
+note = ifnull(cf.get(CF_NOTE), "").toString().trim();
+
+fullName = "";
+if(ticket.get("contactId") != null)
+{
+	contact = zoho.desk.getRecordById(ORG, "contacts", ticket.get("contactId").toLong(), "zdesk");
+	fullName = (ifnull(contact.get("firstName"), "") + " " + ifnull(contact.get("lastName"), "")).toString().trim();
+	if(email == "")
+	{
+		email = ifnull(contact.get("email"), "").toString().trim().toLowerCase();
+	}
+}
+firstName = fullName;
+if(fullName.contains(" "))
+{
+	firstName = fullName.getPrefix(" ").trim();
+}
+log = log + "Ticket #" + tn + " | " + fullName + " (first: " + firstName + ") | " + email + NL;
+
+// ------- 2. FINAL ELIGIBILITY RE-CHECK (excluding this ticket's rows) -------
+p1 = Map();
+p1.put("key", BRIDGE_KEY);
+p1.put("action", "checkEligibility");
+p1.put("email", email);
+p1.put("excludeTicket", tn);
+r1 = invokeurl
+[
+	url : BRIDGE_URL + "?payload=" + zoho.encryption.urlEncode(p1.toString())
+	type : GET
+];
+r1 = r1.toString().toMap();
+if(r1 == null || ifnull(r1.get("ok"), false) != true)
+{
+	info "BRIDGE ERROR (eligibility) on ticket #" + tn + " - nothing written, no gchat sent. Response: " + r1;
+	return;
+}
+priorClaims = ifnull(r1.get("priorPayoutClaims"), "0").toString().toLong();
+
+// MUST match the Eligibility Status picklist values EXACTLY:
+if(priorClaims == 0)
+{
+	disc = "60";
+	discLabel = "60% off on next challenge purchase";
+	finalEligibility = "Eligible - 60 First Claim";
+}
+else
+{
+	disc = "30";
+	discLabel = "30% (subsequent payout)";
+	finalEligibility = "Eligible - 30 Subsequent";
+}
+log = log + "Final eligibility: " + disc + "% (prior claims: " + priorClaims + ")\n";
+
+// ---------------------- 3. GENERATE DISCOUNT CODE ---------------------------
+nameUp = firstName.toUpperCase();
+emailUp = email.toUpperCase();
+letterSource = nameUp;
+if(letterSource.length() < 3)
+{
+	letterSource = nameUp + emailUp;
+}
+p2c = letterSource.subString(0, 2);
+p3c = letterSource.subString(0, 3);
+d2 = account;
+d3 = account;
+if(account.length() >= 2)
+{
+	d2 = account.subString(account.length() - 2, account.length());
+}
+if(account.length() >= 3)
+{
+	d3 = account.subString(account.length() - 3, account.length());
+}
+candidates = List();
+candidates.add(p2c + disc + d2);
+candidates.add(p3c + disc + d2);
+candidates.add(p2c + disc + d3);
+for each suffix in {"2","3","4","5","6","7","8","9"}
+{
+	candidates.add(p2c + disc + d2 + suffix);
+}
+code = "";
+for each cand in candidates
+{
+	if(code == "")
+	{
+		pc = Map();
+		pc.put("key", BRIDGE_KEY);
+		pc.put("action", "codeExists");
+		pc.put("code", cand);
+		pc.put("excludeTicket", tn);
+		rc = invokeurl
+		[
+			url : BRIDGE_URL + "?payload=" + zoho.encryption.urlEncode(pc.toString())
+			type : GET
+		];
+		rc = rc.toString().toMap();
+		if(rc != null && ifnull(rc.get("ok"), false) == true && ifnull(rc.get("taken"), true) == false)
+		{
+			code = cand;
+		}
+	}
+}
+if(code == "")
+{
+	info "BRIDGE/CODE ERROR on ticket #" + tn + " - no free code found, nothing written, no gchat sent.";
+	return;
+}
+log = log + "Code: " + code + NL;
+
+// ------------- 4. TWO BRIDGE CALLS WRITE THE TWO TABS -----------------------
+today = zoho.currentdate;
+dStr = today.toString("dd/MM/yyyy");
+endStr = today.addDay(20).toString("dd/MM/yyyy");
+
+assignedBy = "Certificate Flow (Auto)";
+if(ticket.get("modifiedBy") != null)
+{
+	agent = zoho.desk.getRecordById(ORG, "agents", ticket.get("modifiedBy").toLong(), "zdesk");
+	if(agent != null)
+	{
+		assignedBy = (ifnull(agent.get("firstName"), "") + " " + ifnull(agent.get("lastName"), "")).toString().trim();
+	}
+}
+
+payoutRow = Map();
+payoutRow.put("Date", dStr);
+payoutRow.put("Name of the Client", fullName);
+payoutRow.put("Email", email);
+payoutRow.put("Discount Code", code);
+payoutRow.put("Certificate Type", "Payout");
+payoutRow.put("Twitter Links", xlink);
+payoutRow.put("Instagram Links", iglink);
+payoutRow.put("Approved Status", "On Hold");
+// Week is auto-filled by the bridge from Date. H, I, J, M are never touched.
+
+pu = Map();
+pu.put("key", BRIDGE_KEY);
+pu.put("action", "upsertRows");
+pu.put("ticket", tn);
+pu.put("payoutRow", payoutRow);
+ru = invokeurl
+[
+	url : BRIDGE_URL + "?payload=" + zoho.encryption.urlEncode(pu.toString())
+	type : GET
+];
+ru = ru.toString().toMap();
+if(ru == null || ifnull(ru.get("ok"), false) != true)
+{
+	info "BRIDGE ERROR (upsert payout) on ticket #" + tn + " - rows NOT written, no gchat sent. Response: " + ru;
+	return;
+}
+payoutRowNum = "?";
+if(ru.get("payout") != null)
+{
+	payoutRowNum = ifnull(ru.get("payout").get("row"), "?").toString();
+}
+
+couponRow = Map();
+couponRow.put("Codes", code);
+couponRow.put("Discount %", disc);
+couponRow.put("Product", product);
+couponRow.put("Date", dStr);
+couponRow.put("Account", ACCOUNT_APPLIES);
+couponRow.put("Assigned By", assignedBy);
+couponRow.put("Usage limit", "1");
+couponRow.put("Email id", email);
+couponRow.put("Reason for code", disc + "% certificate posting");
+couponRow.put("Start Date", dStr);
+couponRow.put("End Date", endStr);
+// Approved by Director and the blank-header columns are never touched.
+
+pu2 = Map();
+pu2.put("key", BRIDGE_KEY);
+pu2.put("action", "upsertRows");
+pu2.put("ticket", tn);
+pu2.put("couponRow", couponRow);
+ru2 = invokeurl
+[
+	url : BRIDGE_URL + "?payload=" + zoho.encryption.urlEncode(pu2.toString())
+	type : GET
+];
+ru2 = ru2.toString().toMap();
+if(ru2 == null || ifnull(ru2.get("ok"), false) != true)
+{
+	info "BRIDGE ERROR (upsert coupon) on ticket #" + tn + " - Auto Payout row WAS written (row " + payoutRowNum + ") but the Coupon row was NOT. No gchat sent; fix and re-run the transition (send back, re-approve). Response: " + ru2;
+	return;
+}
+couponRowNum = "?";
+if(ru2.get("coupon") != null)
+{
+	couponRowNum = ifnull(ru2.get("coupon").get("row"), "?").toString();
+}
+log = log + "Auto Payout row " + payoutRowNum + " | Coupon row " + couponRowNum + NL;
+
+// --------- 5. WRITE CODE + FINAL ELIGIBILITY, CLEAR NOTE --------------------
+upd = Map();
+cfm = Map();
+cfm.put(CF_CODE, code);
+cfm.put(CF_ELIGIBILITY, finalEligibility);
+cfm.put(CF_NOTE, "");
+upd.put("cf", cfm);
+zoho.desk.update(ORG, "tickets", ticketId.toLong(), upd, "zdesk");
+
+// ---------- 6. THREAD OPENER — TEAM FORMAT ---------------------------------
+// (note was read from the Approver Note field in step 1 and already cleared
+//  in the step-5 update)
+draft = "Client has posted Payout certificate on the X account and Instagram." + NL + NL;
+draft = draft + "Email - " + email + NL;
+draft = draft + "Account no: " + account + NL;
+draft = draft + "Type of certificate: Payout Certificate" + NL;
+draft = draft + "Posted in 24 hrs?: " + posted24 + NL;
+draft = draft + "Total discount: " + discLabel + NL + NL;
+draft = draft + "Twitter X- " + xlink + NL;
+draft = draft + "Instagram - " + iglink + NL + NL;
+draft = draft + "Entry updated in both sheets" + NL;
+draft = draft + "Auto Payout (Row " + payoutRowNum + ") · Acme Trading Coupon Codes (Row " + couponRowNum + ")" + NL;
+// Mention line: real ping only when a genuine ID is configured.
+if(MANAGER_GCHAT_ID != "" && MANAGER_GCHAT_ID != "PASTE_MANAGER_GOOGLE_USER_ID")
+{
+	draft = draft + "<users/" + MANAGER_GCHAT_ID + "> Pls review and grant approval for creation of discount code " + code;
+}
+else
+{
+	draft = draft + "Manager - Pls review and grant approval for creation of discount code " + code;
+}
+
+body = Map();
+body.put("text", draft);
+thread = Map();
+thread.put("threadKey", "cert-" + tn);
+body.put("thread", thread);
+chatHdr = Map();
+chatHdr.put("Content-Type", "application/json");
+invokeurl
+[
+	url : GCHAT_WEBHOOK + "&messageReplyOption=REPLY_MESSAGE_FALLBACK_TO_NEW_THREAD"
+	type : POST
+	parameters : body.toString()
+	headers : chatHdr
+];
+
+log = log + "Thread cert-" + tn + " opened.";
+info log;

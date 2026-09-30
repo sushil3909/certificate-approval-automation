@@ -1,0 +1,236 @@
+// ============================================================================
+// FUNCTION 4 (v7) — FULFIL TRANSITION  · replaces v6 · USE THIS ONE
+// CHANGE FROM v6: all three bridge calls converted to the proven GET transport.
+// ============================================================================
+// CHANGE FROM v5 (Plan B notes): the optional agent note comes from the
+// "Approver Note" field (cf_approver_note) instead of ticket comments, and
+// the field is cleared after the thread post (skipped on the BLOCKED path —
+// the ticket is closed there, so nothing can leak forward).
+// CHANGE FROM v4: the client's first name for the email greeting now comes
+// from the CONTACT record (first word of the full name your form saves there).
+// No cf first-name field is needed — CF_FIRSTNAME removed.
+//
+// WHERE IT RUNS : "Business Team Review -> Fulfilled" (T10; button visible
+//                 only when Code Created = Yes)
+// ARGUMENTS     : ticketId -> Value: Ticket Id (field)
+//                 orgId    -> Value: Specify custom value -> your org ID
+// ============================================================================
+
+// ------------------------------ CONFIG --------------------------------------
+ORG = orgId.toLong();
+// Connection: Deluge requires the connection LINK NAME as a literal string
+// at every call site, so "zdesk" is written directly below. If your
+// connection link name differs, find-replace "zdesk" in this file.
+BRIDGE_URL = "https://script.google.com/macros/s/YOUR_DEPLOYMENT_ID/exec";
+BRIDGE_KEY = "YOUR_VALUE_HERE";
+GCHAT_WEBHOOK = "https://chat.googleapis.com/v1/spaces/SPACE_ID/messages?key=KEY&token=TOKEN";
+FROM_EMAIL = "support@example.com";
+CF_CODE = "cf_discount_code";
+CF_NOTE = "cf_multi_line_1";                 // verify exact API name (Fields List)
+
+// ---- EDITABLE EMAIL WORDING (placeholders: {{NAME}}, {{CODE}}, {{ENDDATE}}) ----
+subject60 = "Your 60% Acme Trading discount code is here!";
+body60 = "<p>Hi {{NAME}},</p><p>Thank you for sharing your payout certificate on X and Instagram - your submission has been approved!</p><p>Your one-time <b>60% discount code</b>: <b>{{CODE}}</b></p><p>Valid until <b>{{ENDDATE}}</b> on your next purchase. The code is single-use and applies to $10K to $100K Challenge accounts.</p><p>Happy trading,<br>Team Acme Trading</p>";
+subject30 = "Your 30% Acme Trading discount code is here!";
+body30 = "<p>Hi {{NAME}},</p><p>Thank you for sharing your payout certificate on X and Instagram - your submission has been approved!</p><p>As you've availed this reward before, here is your one-time <b>30% discount code</b>: <b>{{CODE}}</b></p><p>Valid until <b>{{ENDDATE}}</b> on your next purchase. The code is single-use and applies to $10K to $100K Challenge accounts.</p><p>Happy trading,<br>Team Acme Trading</p>";
+
+bhdr = Map();
+bhdr.put("Content-Type", "application/json");
+chatHdr = Map();
+chatHdr.put("Content-Type", "application/json");
+log = "";
+NL = zoho.encryption.urlDecode("%0A");   // real newline (Deluge NL is literal text)
+
+// --------------------- 1. FETCH TICKET + CONTACT NAME ------------------------
+ticket = zoho.desk.getRecordById(ORG, "tickets", ticketId.toLong(), "zdesk");
+cf = ifnull(ticket.get("cf"), Map());
+tn = ifnull(ticket.get("ticketNumber"), ticketId).toString();
+email = ifnull(ticket.get("email"), "").toString().trim().toLowerCase();
+code = ifnull(cf.get(CF_CODE), "").toString().trim();
+note = ifnull(cf.get(CF_NOTE), "").toString().trim();
+
+firstName = "there";
+if(ticket.get("contactId") != null)
+{
+	contact = zoho.desk.getRecordById(ORG, "contacts", ticket.get("contactId").toLong(), "zdesk");
+	cname = (ifnull(contact.get("firstName"), "") + " " + ifnull(contact.get("lastName"), "")).toString().trim();
+	if(cname != "")
+	{
+		firstName = cname;
+		if(cname.contains(" "))
+		{
+			firstName = cname.getPrefix(" ").trim();
+		}
+	}
+	if(email == "")
+	{
+		email = ifnull(contact.get("email"), "").toString().trim().toLowerCase();
+	}
+}
+
+thread = Map();
+thread.put("threadKey", "cert-" + tn);
+
+// ------------------ 2. SAFETY GATE VIA THE BRIDGE ---------------------------
+pg1 = Map();
+pg1.put("key", BRIDGE_KEY);
+pg1.put("action", "getRow");
+pg1.put("tab", "payout");
+pg1.put("ticket", tn);
+rg1 = invokeurl
+[
+	url : BRIDGE_URL + "?payload=" + zoho.encryption.urlEncode(pg1.toString())
+	type : GET
+];
+rg1 = rg1.toString().toMap();
+pg2 = Map();
+pg2.put("key", BRIDGE_KEY);
+pg2.put("action", "getRow");
+pg2.put("tab", "coupon");
+pg2.put("ticket", tn);
+rg2 = invokeurl
+[
+	url : BRIDGE_URL + "?payload=" + zoho.encryption.urlEncode(pg2.toString())
+	type : GET
+];
+rg2 = rg2.toString().toMap();
+
+ok1 = rg1 != null && ifnull(rg1.get("ok"), false) == true && ifnull(rg1.get("found"), false) == true;
+ok2 = rg2 != null && ifnull(rg2.get("ok"), false) == true && ifnull(rg2.get("found"), false) == true;
+
+disc = "";
+endDate = "";
+if(ok2)
+{
+	crow = rg2.get("row");
+	disc = ifnull(crow.get("Discount %"), "").toString().replaceAll("%", "").trim();
+	if(disc.contains("."))
+	{
+		disc = disc.getPrefix(".");
+	}
+	endDate = ifnull(crow.get("End Date"), "").toString();
+}
+
+if(!ok1 || !ok2 || code == "" || (disc != "60" && disc != "30"))
+{
+	warn = "⚠ Fulfil BLOCKED for Ticket #" + tn + " - ";
+	if(code == "")
+	{
+		warn = warn + "no discount code on the ticket. ";
+	}
+	if(!ok1)
+	{
+		warn = warn + "Auto Payout row missing. ";
+	}
+	if(!ok2)
+	{
+		warn = warn + "Coupon Codes row missing. ";
+	}
+	if(ok2 && disc != "60" && disc != "30")
+	{
+		warn = warn + "Discount % in the coupon row is '" + disc + "' (expected 60 or 30). ";
+	}
+	warn = warn + "Client email NOT sent and Approved Status NOT flipped. The ticket is already marked Fulfilled, so fix this manually: restore the missing/incorrect sheet row using the details in this thread, then email the client their code, or ask an admin.";
+	body = Map();
+	body.put("text", warn);
+	body.put("thread", thread);
+	invokeurl
+	[
+		url : GCHAT_WEBHOOK + "&messageReplyOption=REPLY_MESSAGE_FALLBACK_TO_NEW_THREAD"
+		type : POST
+		parameters : body.toString()
+		headers : chatHdr
+	];
+	info "BLOCKED: missing/invalid records for ticket #" + tn;
+	return;
+}
+
+// ------------------------ 3. EMAIL THE CLIENT -------------------------------
+if(disc == "60")
+{
+	subj = subject60;
+	bodyHtml = body60;
+}
+else
+{
+	subj = subject30;
+	bodyHtml = body30;
+}
+bodyHtml = bodyHtml.replaceAll("{{NAME}}", firstName).replaceAll("{{CODE}}", code).replaceAll("{{ENDDATE}}", endDate);
+
+mail = Map();
+mail.put("channel", "EMAIL");
+mail.put("to", email);
+mail.put("fromEmailAddress", FROM_EMAIL);
+mail.put("contentType", "html");
+mail.put("content", bodyHtml);
+hdr = Map();
+hdr.put("orgId", orgId);
+hdr.put("Content-Type", "application/json");
+invokeurl
+[
+	url : "https://desk.zoho.in/api/v1/tickets/" + ticketId + "/sendReply"
+	type : POST
+	parameters : mail.toString()
+	headers : hdr
+	connection : "zdesk"
+];
+log = log + "Ticket #" + tn + " | " + disc + "% code " + code + " emailed to " + email + NL;
+
+// -------------- 4. FLIP APPROVED STATUS: On Hold -> Approved ----------------
+ps = Map();
+ps.put("key", BRIDGE_KEY);
+ps.put("action", "updateStatus");
+ps.put("ticket", tn);
+ps.put("status", "Approved");
+rs = invokeurl
+[
+	url : BRIDGE_URL + "?payload=" + zoho.encryption.urlEncode(ps.toString())
+	type : GET
+];
+rs = rs.toString().toMap();
+statusNote = "status flip FAILED - set Approved manually";
+if(rs != null && ifnull(rs.get("ok"), false) == true && ifnull(rs.get("updated"), "0").toString() != "0")
+{
+	statusNote = "Approved Status flipped to Approved";
+}
+log = log + statusNote + NL;
+
+// --------- 5. THREAD: AGENT'S NOTE (IF ANY) + SYSTEM LINE -------------------
+author = "Team member";
+if(ticket.get("modifiedBy") != null)
+{
+	agent = zoho.desk.getRecordById(ORG, "agents", ticket.get("modifiedBy").toLong(), "zdesk");
+	if(agent != null)
+	{
+		author = (ifnull(agent.get("firstName"), "") + " " + ifnull(agent.get("lastName"), "")).toString().trim();
+	}
+}
+// (note was read from the Approver Note field in step 1)
+
+msg = "";
+if(note != "")
+{
+	msg = author + ": " + note + NL;
+}
+msg = msg + "🎉 Fulfilled - code " + code + " (" + disc + "%) emailed to client, valid until " + endDate + ". " + statusNote + ". Ticket closed.";
+
+body = Map();
+body.put("text", msg);
+body.put("thread", thread);
+invokeurl
+[
+	url : GCHAT_WEBHOOK + "&messageReplyOption=REPLY_MESSAGE_FALLBACK_TO_NEW_THREAD"
+	type : POST
+	parameters : body.toString()
+	headers : chatHdr
+];
+
+// Clear the note field:
+upd = Map();
+cfm2 = Map();
+cfm2.put(CF_NOTE, "");
+upd.put("cf", cfm2);
+zoho.desk.update(ORG, "tickets", ticketId.toLong(), upd, "zdesk");
+
+info log;
